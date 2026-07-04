@@ -1,6 +1,8 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from transformers import AutoConfig
+
+from nanovllm.speculative import SpeculativeRuntimeConfig
 
 
 @dataclass(slots=True)
@@ -16,6 +18,7 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    speculative_config: SpeculativeRuntimeConfig = field(default_factory=SpeculativeRuntimeConfig)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

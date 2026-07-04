@@ -1,6 +1,7 @@
 import pickle
 import torch
 import torch.distributed as dist
+from time import perf_counter
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -8,6 +9,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.speculative import should_use_greedy_verification
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -22,6 +24,8 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.last_speculative_forward_ms = 0.0
+        self.last_speculative_argmax_ms = 0.0
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -216,6 +220,50 @@ class ModelRunner:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        reset_context()
+        return token_ids
+
+    @torch.inference_mode()
+    def run_speculative(self, seq: Sequence, draft_token_ids: list[int]) -> list[int]:
+        assert self.world_size == 1, "speculative verification currently supports tensor_parallel_size=1"
+        self.last_speculative_forward_ms = 0.0
+        self.last_speculative_argmax_ms = 0.0
+        token_ids = [seq.last_token] + draft_token_ids
+        start = seq.num_cached_tokens
+        end = start + len(token_ids)
+        input_ids = torch.tensor(token_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(range(start, end), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor([0, len(token_ids)], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor([0, end], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = [
+            seq.block_table[position // self.block_size] * self.block_size + position % self.block_size
+            for position in range(start, end)
+        ]
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables([seq])
+        set_context(True, cu_seqlens_q, cu_seqlens_k, len(token_ids), end, slot_mapping, None, block_tables)
+        forward_start = perf_counter()
+        hidden_states = self.model(input_ids, positions)
+        reset_context()
+        logits = self.model.compute_logits(hidden_states)
+        self.last_speculative_forward_ms = (perf_counter() - forward_start) * 1000
+        if should_use_greedy_verification(
+            seq.temperature,
+            self.config.speculative_config.greedy_verification_temperature,
+        ):
+            argmax_start = perf_counter()
+            token_ids = logits.float().argmax(dim=-1).tolist()
+            self.last_speculative_argmax_ms = (perf_counter() - argmax_start) * 1000
+        else:
+            temperatures = torch.full(
+                (len(token_ids),),
+                seq.temperature,
+                dtype=torch.float32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            sampler_start = perf_counter()
+            token_ids = self.sampler(logits, temperatures).tolist()
+            self.last_speculative_argmax_ms = (perf_counter() - sampler_start) * 1000
         reset_context()
         return token_ids
 
