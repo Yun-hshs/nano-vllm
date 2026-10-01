@@ -7,6 +7,8 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.layers.attention import FP8_E4M3_DTYPE, FP8_E4M3_MAX
+from nanovllm.layers import fused_ops
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -25,13 +27,18 @@ class ModelRunner:
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        fused_ops.set_fused_enabled(config.triton_fusion)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.fp8_kvcache = config.fp8_kvcache
+        self.k_scale_buf = None
         self.warmup_model()
+        if self.fp8_kvcache:
+            self.calibrate_k_scale()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -97,8 +104,54 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        self.run([], seqs)
         torch.cuda.empty_cache()
+
+    def calibrate_k_scale(self):
+        """One-shot static K scale calibration.
+
+        K is quantized with a fixed per-(layer, kv_head) scale because its
+        magnitude distribution is stable across tokens, so the write kernel can
+        skip the per-token reduction that V requires. The amax is collected by
+        running a short prefill of random tokens through the real model, which
+        makes the scale reflect the post-RoPE / post-k_norm K that is actually
+        written into the cache.
+        """
+        config = self.config
+        hf_config = config.hf_config
+        num_layers = hf_config.num_hidden_layers
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if config.fp8_kv_k_scale is not None:
+            self.k_scale_buf = torch.full((num_layers, num_kv_heads), float(config.fp8_kv_k_scale), dtype=torch.float32, device="cuda")
+            return
+        assert config.fp8_kv_calib_tokens > 0, "fp8_kvcache requires fp8_kv_calib_tokens > 0 or an explicit fp8_kv_k_scale"
+        amax = torch.zeros(num_layers, num_kv_heads, dtype=torch.float32, device="cuda")
+        handles = []
+        layer_id = 0
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                lid = layer_id
+                def hook(module, args, lid=lid):
+                    k = args[1]
+                    amax[lid] = torch.maximum(amax[lid], k.detach().float().abs().amax(dim=(0, 2)))
+                handles.append(module.register_forward_pre_hook(hook))
+                layer_id += 1
+        assert layer_id == num_layers, f"found {layer_id} attention layers, expected {num_layers}"
+        chunk = min(64, config.max_num_batched_tokens)
+        num_seqs = max(1, config.fp8_kv_calib_tokens // chunk)
+        generator = torch.Generator(device="cpu").manual_seed(0)
+        seqs = []
+        for _ in range(num_seqs):
+            ids = torch.randint(0, hf_config.vocab_size, (chunk,), generator=generator, device="cpu").tolist()
+            seq = Sequence(ids)
+            seq.num_scheduled_tokens = chunk
+            seqs.append(seq)
+        try:
+            self.run([], seqs)
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.k_scale_buf = (amax * config.fp8_kv_k_margin / FP8_E4M3_MAX).clamp_min(1e-12).clone()
 
     def allocate_kv_cache(self):
         config = self.config
@@ -109,15 +162,33 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        if self.fp8_kvcache:
+            cache_dtype = FP8_E4M3_DTYPE
+            itemsize = 1
+            # one fp16 dynamic V scale per (token, kv_head), for every layer
+            scale_bytes = hf_config.num_hidden_layers * self.block_size * num_kv_heads * 2
+        else:
+            cache_dtype = hf_config.dtype
+            itemsize = hf_config.dtype.itemsize
+            scale_bytes = 0
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * itemsize + scale_bytes
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, dtype=cache_dtype)
+        if self.fp8_kvcache:
+            assert self.k_scale_buf is not None, "fp8_kvcache requires calibrate_k_scale() before allocating the cache"
+            num_slots = config.num_kvcache_blocks * self.block_size
+            self.k_scale = self.k_scale_buf.to(device="cuda", dtype=torch.float32)
+            self.v_scale_cache = torch.empty(hf_config.num_hidden_layers, num_slots, num_kv_heads, dtype=torch.float16)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                module.fp8_kvcache = self.fp8_kvcache
+                if self.fp8_kvcache:
+                    module.k_scale = self.k_scale[layer_id]
+                    module.v_scale_cache = self.v_scale_cache[layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -125,6 +196,50 @@ class ModelRunner:
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
+
+    def prepare_prefill_gather_slots(self, cu_seqlens_k: torch.Tensor, block_tables: torch.Tensor, total_kv_tokens: int):
+        """Flat physical-slot index for every cached token of every sequence,
+        ordered like `cu_seqlens_k`. Only used by the FP8 gather + dequant
+        prefill path; built with vectorised torch ops so it is O(tokens) but
+        launch-free."""
+        device = block_tables.device
+        num_seqs = block_tables.size(0)
+        seqlens = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int64)
+        seq_idx = torch.repeat_interleave(torch.arange(num_seqs, dtype=torch.int64, device=device), seqlens)
+        pos = torch.arange(total_kv_tokens, dtype=torch.int64, device=device) - cu_seqlens_k[seq_idx].to(torch.int64)
+        blocks = block_tables[seq_idx, pos // self.block_size].to(torch.int64)
+        slots = blocks * self.block_size + (pos % self.block_size)
+        return slots.to(torch.int32)
+
+    @staticmethod
+    def prefill_kv_group_bounds(cu_q: list, cu_k: list, budget: int):
+        """Split a prefill batch into consecutive sequence groups whose gathered
+        KV span stays within `budget` tokens.
+
+        `cu_seqlens_k` counts full contexts, so with prefix caching a batch of
+        many long-prefix-hit sequences can reference far more KV than the
+        prefill token budget. Grouping bounds the dequantized dense buffer
+        without changing the result.
+        """
+        num_seqs = len(cu_q) - 1
+        bounds = []
+        start = 0
+        while start < num_seqs:
+            end = start + 1
+            while end < num_seqs and cu_k[end + 1] - cu_k[start] <= budget:
+                end += 1
+            bounds.append((start, end, cu_q[start], cu_q[end], cu_k[start], cu_k[end]))
+            start = end
+        return bounds
+
+    def prepare_prefill_kv_groups(self, cu_q: list, cu_k: list):
+        budget = self.config.max_num_batched_tokens
+        groups = []
+        for start, end, q0, q1, k0, k1 in self.prefill_kv_group_bounds(cu_q, cu_k, budget):
+            cu_q_local = torch.tensor([v - q0 for v in cu_q[start:end + 1]], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            cu_k_local = torch.tensor([v - k0 for v in cu_k[start:end + 1]], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            groups.append((q0, q1, k0, k1, cu_q_local, cu_k_local))
+        return groups
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -159,14 +274,21 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        total_kv_tokens = cu_seqlens_k[-1]
+        if total_kv_tokens > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        cu_seqlens_q_list, cu_seqlens_k_list = cu_seqlens_q, cu_seqlens_k
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        prefill_gather_slots = None
+        prefill_kv_groups = None
+        if self.fp8_kvcache and block_tables is not None:
+            prefill_gather_slots = self.prepare_prefill_gather_slots(cu_seqlens_k, block_tables, total_kv_tokens)
+            prefill_kv_groups = self.prepare_prefill_kv_groups(cu_seqlens_q_list, cu_seqlens_k_list)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, prefill_gather_slots, prefill_kv_groups)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -211,7 +333,21 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    @torch.inference_mode()
+    def run(self, decode_seqs: list[Sequence], prefill_seqs: list[Sequence]) -> tuple[list[int], list[int]]:
+        """Execute one scheduling step.
+
+        Decode runs first through its captured CUDA graph (one token per
+        sequence); the prefill chunk then runs eager on the leftover token
+        budget. Keeping the two as separate dispatches inside one step is what
+        lets a long prompt make progress without stalling the decode stream,
+        while decode stays on the graph-captured fast path.
+        """
+        decode_token_ids = self._run_batch(decode_seqs, False) if decode_seqs else []
+        prefill_token_ids = self._run_batch(prefill_seqs, True) if prefill_seqs else []
+        return decode_token_ids, prefill_token_ids
+
+    def _run_batch(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)

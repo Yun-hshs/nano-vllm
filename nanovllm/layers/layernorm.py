@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 
+from nanovllm.layers import fused_ops
+
 
 class RMSNorm(nn.Module):
 
@@ -44,6 +46,12 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if fused_ops.fused_enabled():
+            # Single-pass Triton: one read of x/residual/weight, one write of the
+            # normed row and one of the new residual (no fp32 intermediates).
+            if residual is None:
+                return fused_ops.rms_norm(x, self.weight, self.eps)
+            return fused_ops.add_rms_norm(x, residual, self.weight, self.eps)
         if residual is None:
             return self.rms_forward(x)
         else:

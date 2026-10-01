@@ -25,3 +25,9 @@ Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a CUDA GPU",
+    "logits: end-to-end logits alignment, requires NANOVLLM_TEST_MODEL and a CUDA GPU",
+]
